@@ -1,0 +1,554 @@
+
+
+
+
+# 1. `make_fd()` — the simulation function
+
+Takes a matrix of coefficient draws and builds three counterfactual datasets: one where
+every voter sits exactly at the reference party's position on the chosen dimension, and two
+where they sit `delta` units either side of it (clamped to the 0–10 scale when
+`squish = TRUE`).
+
+For each draw it recomputes fitted probabilities without re-estimating the
+model, differences them against the baseline, averages the two sides, and returns the mean
+change in each party's vote probability.
+
+```{r make-fd}
+make_fd <- function(B,
+                    model,
+                    data,
+                    ref_party = c("Reform", "Labour", "LibDem", "Conservative", "Green"),
+                    dimension = c("tax", "ineq"),
+                    delta = 1,
+                    squish = TRUE,
+                    ...){
+  rp <- match.arg(ref_party)
+  dim <- match.arg(dimension)
+
+  if(!is.matrix(B))B <- matrix(B, nrow=1)
+  tmp <- data
+  ref <- subset(tmp, alt == rp) |> unclass()
+  ref$chid <- unfold_idx(ref$idx)$chid
+  ref <- ref[c("rp_tax", "rp_ineq", "chid")]
+  ref <- do.call(data.frame, ref)
+  names(ref) <- c("ref_tax", "ref_ineq", "chid")
+  tmp <- left_join(tmp, ref, by = join_by(chid))
+
+  tmp0 <- tmpm <- tmpp <- tmp
+  tmp0[[paste0("lrself_", dim)]] <- tmp0[[paste0("ref_", dim)]]
+  if(squish){
+    tmpm[[paste0("lrself_", dim)]] <- ifelse(
+      tmp0[[paste0("ref_",dim)]] - delta < 0,
+      0,
+      tmp0[[paste0("ref_",dim)]] - delta)
+    tmpp[[paste0("lrself_", dim)]] <- ifelse(
+      tmpp[[paste0("ref_",dim)]] + delta > 10,
+      10,
+      tmpp[[paste0("ref_",dim)]] + delta)
+  }else{
+    tmpm[[paste0("lrself_", dim)]] <- tmp0[[paste0("ref_",dim)]] - delta
+    tmpp[[paste0("lrself_", dim)]] <- tmpp[[paste0("ref_",dim)]] + delta
+
+  }
+
+  res <- lapply(1:nrow(B), \(i){
+    p0 <- update(model, data = tmp0, start = B[i,], iterlim = 0, print.level = 0)$probabilities
+    pm <- update(model, data = tmpp, start = B[i,], iterlim = 0, print.level = 0)$probabilities
+    pp <- update(model, data = tmpm, start = B[i,], iterlim = 0, print.level = 0)$probabilities
+    diffm <- pm-p0
+    diffp <- pp-p0
+    diff <- (diffm + diffp)/2
+    do.call(data.frame, as.list(colMeans(diff)))
+  })
+  do.call(rbind, res)
+}
+```
+
+
+```{r packages-data}
+library(tidyverse)
+library(mlogit)
+library(MASS)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(here)
+library(readr)
+library(marginaleffects)
+library(dfidx)
+
+select <- dplyr::select
+
+dat <- read_csv(here("data", "bes2024_small_clean.csv"))
+
+dat <- dat %>%
+  mutate(
+    vote     = factor(vote, levels = c("Labour", "Conservative", "LibDem", "Reform", "Green")),
+    age_band = factor(age_band),
+    degree   = factor(degree),
+    Region_lab = factor(Region_lab)
+  )
+```
+
+# 3. Reshape to long format
+
+Identifies the `rp_tax.*` and `rp_ineq.*` columns holding each party's position, then expands each
+respondent into five rows, one per party alternative, with the party positions as
+alternative-specific variables.
+
+```{r reshape}
+tax_cols  <- grep("^rp_tax\\.",  names(dat))
+ineq_cols <- grep("^rp_ineq\\.", names(dat))
+
+dat2 <- dat %>%
+  dplyr::select(vote, Age, lrself_tax, lrself_ineq,
+                age_band, degree, Region_lab, wt_vote,
+                all_of(names(dat)[tax_cols]),
+                all_of(names(dat)[ineq_cols])) %>%
+  na.omit() %>%
+  as.data.frame()
+
+mldat <- mlogit.data(dat2, choice = "vote", shape = "wide",
+                     varying = c(which(names(dat2) %in% names(dat)[tax_cols]),
+                                 which(names(dat2) %in% names(dat)[ineq_cols])))
+```
+
+# 4. The models
+
+`mod_party` is a conditional logit where Age and degree get party-specific coefficients and
+the two absolute distances (tax, inequality) get a **separate proximity coefficient for each
+party**, so proximity can matter more for some parties than others. `mod_party2` fits the
+same variables with a single shared proximity coefficient as a comparison spec, but is never
+used downstream.
+
+```{r models}
+mod_party <- mlogit(
+  vote ~ 0 | Age + degree | I(abs(lrself_tax - rp_tax)) + I(abs(lrself_ineq - rp_ineq)) ,
+  data = mldat, reflevel = "Labour",
+  weights = wt_vote
+)
+
+mod_party2 <- mlogit(
+  vote ~ I(abs(lrself_tax - rp_tax)) + I(abs(lrself_ineq - rp_ineq)) | Age + degree ,
+  data = mldat, reflevel = "Labour",
+  weights = wt_vote
+)
+```
+
+
+
+# 5. Coefficient draws
+
+Draws 1,000 coefficient vectors from a multivariate normal centred on the estimates with the
+model's covariance matrix — a parametric bootstrap used to put confidence intervals on the
+simulated quantities. 
+
+```{r draws}
+library(future)
+library(future.apply)
+plan(multisession(workers = 10))
+
+B <- MASS::mvrnorm(1000, coef(mod_party), vcov(mod_party))
+Blist <- asplit(B, 1)
+```
+
+# 6. Running the full grid
+
+Repeats the same block ten times: five reference parties crossed with the two dimensions,
+each looped over delta values 1 to 5, running `make_fd` across all 1,000 draws. Each block
+keeps only the column for its own reference party — i.e. what happens to Reform's vote
+probability as voters move away from Reform — accumulating into `all_res_tax` and then
+`all_res_ineq`.
+
+## 6a. Tax dimension
+
+```{r grid-tax-reform}
+res <- lapply(1:5, \(i)future_lapply(
+  Blist,
+  make_fd,
+  model = mod_party,
+  data = mldat,
+  ref_party = "Reform",
+  delta=i,
+  future.packages = c("mlogit", "dplyr"),
+  future.seed = TRUE
+))
+
+res <- lapply(res, \(x)bind_rows(x))
+res <- bind_rows(res, .id = "delta") |>
+  mutate(delta = as.numeric(delta))
+all_res <- NULL
+all_res <- all_res |>
+  bind_rows(
+    res |> select(delta, Reform) |> mutate(party = "Reform") |> rename(vote_prob = Reform)
+  )
+```
+
+```{r grid-tax-conservative}
+res <- lapply(1:5, \(i)future_lapply(
+  Blist,
+  make_fd,
+  model = mod_party,
+  data = mldat,
+  ref_party = "Conservative",
+  delta=i,
+  future.packages = c("mlogit", "dplyr"),
+  future.seed = TRUE
+))
+
+res <- lapply(res, \(x)bind_rows(x))
+res <- bind_rows(res, .id = "delta") |>
+  mutate(delta = as.numeric(delta))
+
+all_res <- all_res |>
+  bind_rows(
+    res |> select(delta, Conservative) |> mutate(party = "Conservative") |> rename(vote_prob = Conservative)
+  )
+```
+
+```{r grid-tax-labour}
+res <- lapply(1:5, \(i)future_lapply(
+  Blist,
+  make_fd,
+  model = mod_party,
+  data = mldat,
+  ref_party = "Labour",
+  delta=i,
+  future.packages = c("mlogit", "dplyr"),
+  future.seed = TRUE
+))
+
+res <- lapply(res, \(x)bind_rows(x))
+res <- bind_rows(res, .id = "delta") |>
+  mutate(delta = as.numeric(delta))
+
+all_res <- all_res |>
+  bind_rows(
+    res |> select(delta, Labour) |> mutate(party = "Labour") |> rename(vote_prob = Labour)
+  )
+```
+
+```{r grid-tax-libdem}
+res <- lapply(1:5, \(i)future_lapply(
+  Blist,
+  make_fd,
+  model = mod_party,
+  data = mldat,
+  ref_party = "LibDem",
+  delta=i,
+  future.packages = c("mlogit", "dplyr"),
+  future.seed = TRUE
+))
+
+res <- lapply(res, \(x)bind_rows(x))
+res <- bind_rows(res, .id = "delta") |>
+  mutate(delta = as.numeric(delta))
+
+all_res <- all_res |>
+  bind_rows(
+    res |> select(delta, LibDem) |> mutate(party = "LibDem") |> rename(vote_prob = LibDem)
+  )
+```
+
+```{r grid-tax-green}
+res <- lapply(1:5, \(i)future_lapply(
+  Blist,
+  make_fd,
+  model = mod_party,
+  data = mldat,
+  ref_party = "Green",
+  delta=i,
+  future.packages = c("mlogit", "dplyr"),
+  future.seed = TRUE
+))
+
+res <- lapply(res, \(x)bind_rows(x))
+res <- bind_rows(res, .id = "delta") |>
+  mutate(delta = as.numeric(delta))
+
+all_res <- all_res |>
+  bind_rows(
+    res |> select(delta, Green) |> mutate(party = "Green") |> rename(vote_prob = Green)
+  )
+
+all_res_tax <- all_res
+```
+
+## 6b. Inequality dimension
+
+Identical to the above, with `dimension = "ineq"` passed through to `make_fd` so the
+inequality/redistribution scale is the one being run `all_res` is reset to `NULL`
+first and snapshotted as `all_res_ineq` at the end.
+
+```{r grid-ineq-reform}
+res <- lapply(1:5, \(i)future_lapply(
+  Blist,
+  make_fd,
+  model = mod_party,
+  data = mldat,
+  dimension = "ineq",
+  ref_party = "Reform",
+  delta=i,
+  future.packages = c("mlogit", "dplyr"),
+  future.seed = TRUE
+))
+
+res <- lapply(res, \(x)bind_rows(x))
+res <- bind_rows(res, .id = "delta") |>
+  mutate(delta = as.numeric(delta))
+all_res <- NULL
+all_res <- all_res |>
+  bind_rows(
+    res |> select(delta, Reform) |> mutate(party = "Reform") |> rename(vote_prob = Reform)
+  )
+```
+
+```{r grid-ineq-conservative}
+res <- lapply(1:5, \(i)future_lapply(
+  Blist,
+  make_fd,
+  model = mod_party,
+  data = mldat,
+  dimension = "ineq",
+  ref_party = "Conservative",
+  delta=i,
+  future.packages = c("mlogit", "dplyr"),
+  future.seed = TRUE
+))
+
+res <- lapply(res, \(x)bind_rows(x))
+res <- bind_rows(res, .id = "delta") |>
+  mutate(delta = as.numeric(delta))
+
+all_res <- all_res |>
+  bind_rows(
+    res |> select(delta, Conservative) |> mutate(party = "Conservative") |> rename(vote_prob = Conservative)
+  )
+```
+
+```{r grid-ineq-labour}
+res <- lapply(1:5, \(i)future_lapply(
+  Blist,
+  make_fd,
+  model = mod_party,
+  data = mldat,
+  dimension = "ineq",
+  ref_party = "Labour",
+  delta=i,
+  future.packages = c("mlogit", "dplyr"),
+  future.seed = TRUE
+))
+
+res <- lapply(res, \(x)bind_rows(x))
+res <- bind_rows(res, .id = "delta") |>
+  mutate(delta = as.numeric(delta))
+
+all_res <- all_res |>
+  bind_rows(
+    res |> select(delta, Labour) |> mutate(party = "Labour") |> rename(vote_prob = Labour)
+  )
+```
+
+```{r grid-ineq-libdem}
+res <- lapply(1:5, \(i)future_lapply(
+  Blist,
+  make_fd,
+  model = mod_party,
+  data = mldat,
+  dimension = "ineq",
+  ref_party = "LibDem",
+  delta=i,
+  future.packages = c("mlogit", "dplyr"),
+  future.seed = TRUE
+))
+
+res <- lapply(res, \(x)bind_rows(x))
+res <- bind_rows(res, .id = "delta") |>
+  mutate(delta = as.numeric(delta))
+
+all_res <- all_res |>
+  bind_rows(
+    res |> select(delta, LibDem) |> mutate(party = "LibDem") |> rename(vote_prob = LibDem)
+  )
+```
+
+```{r grid-ineq-green}
+res <- lapply(1:5, \(i)future_lapply(
+  Blist,
+  make_fd,
+  model = mod_party,
+  data = mldat,
+  dimension = "ineq",
+  ref_party = "Green",
+  delta=i,
+  future.packages = c("mlogit", "dplyr"),
+  future.seed = TRUE
+))
+
+res <- lapply(res, \(x)bind_rows(x))
+res <- bind_rows(res, .id = "delta") |>
+  mutate(delta = as.numeric(delta))
+
+all_res <- all_res |>
+  bind_rows(
+    res |> select(delta, Green) |> mutate(party = "Green") |> rename(vote_prob = Green)
+  )
+
+all_res_ineq <- all_res
+```
+
+
+# 7. Draft plots
+
+Collapses the draws into a posterior mean and 2.5/97.5 percentile interval for each delta and
+party. Plots these as a line  faceted by party, separately for tax and
+inequality.
+
+```{r draft-plots}
+all_res_tax |>
+  summarise(est = mean(vote_prob),
+         lwr = quantile(vote_prob, .025),
+         upr = quantile(vote_prob, .975),
+         .by = c(delta, party)) |>
+  ggplot(aes(x=delta, y = est, ymin = lwr, ymax=upr)) +
+  geom_ribbon(alpha=.25) +
+  geom_line() +
+  facet_wrap(~party) +
+  theme_bw()
+
+all_res_ineq |>
+  summarise(est = mean(vote_prob),
+            lwr = quantile(vote_prob, .025),
+            upr = quantile(vote_prob, .975),
+            .by = c(delta, party)) |>
+  ggplot(aes(x=delta, y = est, ymin = lwr, ymax=upr)) +
+  geom_ribbon(alpha=.25) +
+  geom_line() +
+  facet_wrap(~party) +
+  theme_bw()
+```
+
+# 8. Party position map
+
+Computes mean voter self-placement and mean party positions on both scales, then reshapes
+them into one row per party. Plots them as a labelled scatter showing where parties and the
+average voter sit in the two-dimensional economic space.
+
+```{r position-map}
+means <- dat2 |>
+  summarise(across(c(starts_with("lrself"), starts_with("rp")), mean))
+
+names(means) <- gsub("rp_(.*)\\.(.*)", "\\2_\\1", names(means))
+names(means) <- gsub("lrself", "Voters", names(means))
+
+means <- pivot_longer(means, cols=everything(), names_pattern = "(.*)_(.*)", names_to = c("party", ".value"))
+
+library(ggrepel)
+ggplot(means, aes(x=tax, y=ineq)) +
+  geom_point() +
+  geom_text_repel(aes(label = party)) +
+  theme_minimal() +
+  labs(x="Taxes", y="Inequality")
+```
+
+# 9. Pairwise significance tests
+
+Reshapes the `delta == 1` draws into a draws-by-party matrix and multiplies it by a contrast
+matrix covering all ten party pairs, giving a distribution of differences for each pair.
+Converts the tail proportions into two-sided empirical p-values and filters to pairs
+significant at p < .05.
+
+```{r pairwise}
+res_mat <- all_res |>
+  filter(delta == 1) |>
+  mutate(obs = row_number(), .by=party) |>
+  pivot_wider(names_from = "party", values_from = "vote_prob") |>
+  select(-c(delta, obs)) |>
+  as.matrix()
+
+combs <- combn(ncol(res_mat), 2)
+D <- matrix(0, nrow=ncol(res_mat), ncol = ncol(combs))
+D[cbind(combs[1,], 1:ncol(combs))] <- -1
+D[cbind(combs[2,], 1:ncol(combs))] <- 1
+
+pd <- res_mat %*% D
+pdiff <- apply(pd, 2, \(x)mean(x < 0))
+pdiff <- ifelse(pdiff > .5, 1-pdiff, pdiff)
+tibble(
+  smaller = colnames(res_mat)[combs[1,]],
+  larger = colnames(res_mat)[combs[2,]],
+  diff = colMeans(pd),
+  pval = pdiff
+) |>
+  filter(pval < .05)
+```
+
+
+
+# 10. Final figures
+
+Refactors the earlier plotting code into `summarise_delta_curve()` and `plot_delta_curve()`,
+adding percent-formatted axes and proper labels, to produce the two final figures.
+
+```{r final-plots}
+summarise_delta_curve <- function(df) {
+  df |>
+    summarise(est = mean(vote_prob),
+              lwr = quantile(vote_prob, .025),
+              upr = quantile(vote_prob, .975),
+              .by = c(delta, party))
+}
+
+plot_delta_curve <- function(summary_df, dim_label) {
+  ggplot(summary_df, aes(x = delta, y = est, ymin = lwr, ymax = upr)) +
+    geom_ribbon(alpha = .25, colour = "transparent", fill = "#2a78d6") +
+    geom_line(colour = "#2a78d6", linewidth = 1) +
+    facet_wrap(~party, ncol = 3) +
+    scale_y_continuous(labels = scales::percent) +
+    labs(x = "Voter's distance from party",
+         y = "Change in Pr(vote), vs. distance 0",
+         title = dim_label) +
+    theme_bw() +
+    theme(panel.grid.minor = element_blank())
+}
+
+delta_curve_tax  <- summarise_delta_curve(all_res_tax)
+delta_curve_ineq <- summarise_delta_curve(all_res_ineq)
+
+p_delta_tax  <- plot_delta_curve(delta_curve_tax,  "Tax and spend")
+p_delta_ineq <- plot_delta_curve(delta_curve_ineq, "Inequality / redistribution")
+
+p_delta_tax
+p_delta_ineq
+```
+
+# 11. Saving output
+
+
+
+```{r save-tables}
+# --- save tables (summarised, for plotting/reporting) -----------------
+
+write.csv(delta_curve_tax,  here("tables", "delta_curve_tax.csv"),  row.names = FALSE)
+write.csv(delta_curve_ineq, here("tables", "delta_curve_ineq.csv"), row.names = FALSE)
+
+saveRDS(delta_curve_tax,  here("tables", "delta_curve_tax.rds"))
+saveRDS(delta_curve_ineq, here("tables", "delta_curve_ineq.rds"))
+
+
+# --- save underlying per-draw results too (raw, in case you need to
+#     re-derive different summaries later without re-running the sims)
+
+write.csv(all_res_tax,  here("tables", "all_res_tax.csv"),  row.names = FALSE)
+write.csv(all_res_ineq, here("tables", "all_res_ineq.csv"), row.names = FALSE)
+
+saveRDS(all_res_tax,  here("tables", "all_res_tax.rds"))
+saveRDS(all_res_ineq, here("tables", "all_res_ineq.rds"))
+```
+
+```{r save-plots}
+# --- save plots ---------------------------------------------------------
+
+ggsave(here("plots", "delta_curve_tax.png"),  p_delta_tax,  width = 9, height = 6, dpi = 300)
+ggsave(here("plots", "delta_curve_ineq.png"), p_delta_ineq, width = 9, height = 6, dpi = 300)
+```
