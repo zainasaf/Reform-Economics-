@@ -535,9 +535,7 @@ saveRDS(delta_curve_tax,  here("tables", "delta_curve_tax.rds"))
 saveRDS(delta_curve_ineq, here("tables", "delta_curve_ineq.rds"))
 
 
-# --- save underlying per-draw results too (raw, in case you need to
-#     re-derive different summaries later without re-running the sims)
-
+# --- save underlying per-draw results too 
 write.csv(all_res_tax,  here("tables", "all_res_tax.csv"),  row.names = FALSE)
 write.csv(all_res_ineq, here("tables", "all_res_ineq.csv"), row.names = FALSE)
 
