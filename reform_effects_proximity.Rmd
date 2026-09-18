@@ -118,8 +118,7 @@ mldat <- mlogit.data(dat2, choice = "vote", shape = "wide",
 `mod_party` is a conditional logit where Age and degree get party-specific coefficients and
 the two absolute distances (tax, inequality) get a **separate proximity coefficient for each
 party**, so proximity can matter more for some parties than others. `mod_party2` fits the
-same variables with a single shared proximity coefficient as a comparison spec, but is never
-used downstream.
+same variables with a single shared proximity coefficient.
 
 ```{r models}
 mod_party <- mlogit(
@@ -488,7 +487,7 @@ tibble(
 # 10. Final figures
 
 Refactors the earlier plotting code into `summarise_delta_curve()` and `plot_delta_curve()`,
-adding percent-formatted axes and proper labels, to produce the two final figures.
+adding percent-formatted axes
 
 ```{r final-plots}
 summarise_delta_curve <- function(df) {
